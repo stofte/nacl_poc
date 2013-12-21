@@ -7,8 +7,10 @@ import glob
 import hashlib
 import optparse
 import os
+import posixpath
 import shutil
 import subprocess
+import stat
 import sys
 import tarfile
 
@@ -128,7 +130,8 @@ def CreateWin32Hardlink(filepath, targpath, try_mklink):
 def ComputeFileHash(filepath):
   """Generate a sha1 hash for the file at the given path."""
   sha1 = hashlib.sha1()
-  sha1.update(open(filepath, 'rb').read())
+  with open(filepath, 'rb') as fp:
+    sha1.update(fp.read())
   return sha1.hexdigest()
 
 
@@ -147,6 +150,7 @@ class CygTar(object):
   """ CygTar is an object which represents a Win32 and Cygwin aware tarball."""
   def __init__(self, filename, mode='r', verbose=False):
     self.size_map = {}
+    self.file_hashes = {}
     # Set errorlevel=1 so that fatal errors actually raise!
     self.tar = tarfile.open(filename, mode, errorlevel=1)
     self.verbose = verbose
@@ -182,7 +186,7 @@ class CygTar(object):
     tarinfo.size = 0
     self.__AddFile(tarinfo)
 
-  def Add(self, filepath):
+  def Add(self, filepath, prefix=None):
     """Add path filepath to the archive which may be Native style.
 
     Add files individually recursing on directories.  For POSIX we use
@@ -195,6 +199,22 @@ class CygTar(object):
     # At this point tarinfo.name will contain a POSIX style path regardless
     # of the original filepath.
     tarinfo = self.tar.gettarinfo(filepath)
+    if prefix:
+      tarinfo.name = posixpath.join(prefix, tarinfo.name)
+
+    if sys.platform == 'win32':
+      # On win32 os.stat() always claims that files are world writable
+      # which means that unless we remove this bit here we end up with
+      # world writables files in the archive, which is almost certainly
+      # not intended.
+      tarinfo.mode &= ~stat.S_IWOTH
+      tarinfo.mode &= ~stat.S_IWGRP
+
+      # If we want cygwin to be able to extract this archive and use
+      # executables and dll files we need to mark all the archive members as
+      # executable.  This is essentially what happens anyway when the
+      # archive is extracted on win32.
+      tarinfo.mode |= stat.S_IXUSR | stat.S_IXOTH | stat.S_IXGRP
 
     # If this a symlink or hardlink, add it
     if tarinfo.issym() or tarinfo.islnk():
@@ -207,7 +227,7 @@ class CygTar(object):
       self.__AddFile(tarinfo)
       native_files = glob.glob(os.path.join(filepath, '*'))
       for native_file in native_files:
-        if not self.Add(native_file): return False
+        if not self.Add(native_file, prefix): return False
       return True
 
     # At this point we only allow addition of "FILES"
@@ -219,7 +239,8 @@ class CygTar(object):
     # We go ahead and check on all platforms just in case we are tar'ing a
     # mount shared with windows.
     if tarinfo.size <= 524:
-      symtext = open(tarinfo.name).read()
+      with open(filepath) as fp:
+        symtext = fp.read()
       if IsCygwinSymlink(symtext):
         self.__AddLink(tarinfo, tarfile.SYMTYPE, SymDatToPath(symtext))
         return True
@@ -231,43 +252,43 @@ class CygTar(object):
     # If that size bucket is empty, add this file, no need to get the hash until
     # we get a bucket collision for the first time..
     if not nodelist:
-      self.size_map[tarinfo.size] = [(tarinfo.name, None)]
-      fp = open(tarinfo.name, 'rb')
-      self.__AddFile(tarinfo, fp)
-      fp.close()
+      self.size_map[tarinfo.size] = [filepath]
+      with open(filepath, 'rb') as fp:
+        self.__AddFile(tarinfo, fp)
       return True
 
     # If the size collides with anything, we'll need to check hashes.  We assume
     # no hash collisions for SHA1 on a given bucket, since the number of files
     # in a bucket over possible SHA1 values is near zero.
-    newhash = ComputeFileHash(tarinfo.name)
-    for (oldname, oldhash) in nodelist:
-      # if this is the first collision, we may need to compute the hash
-      # for this first node.
-      if oldhash is None:
+    newhash = ComputeFileHash(filepath)
+    self.file_hashes[filepath] = newhash
+
+    for oldname in nodelist:
+      oldhash = self.file_hashes.get(oldname, None)
+      if not oldhash:
         oldhash = ComputeFileHash(oldname)
+        self.file_hashes[oldname] = oldhash
 
       if oldhash == newhash:
         self.__AddLink(tarinfo, tarfile.LNKTYPE, oldname)
         return True
 
     # Otherwise, we missed, so add it to the bucket for this size
-    self.size_map[tarinfo.size].append((tarinfo.name, newhash))
-    fp = open(tarinfo.name, 'rb')
-    self.__AddFile(tarinfo, fp)
-    fp.close()
+    self.size_map[tarinfo.size].append(filepath)
+    with open(filepath, 'rb') as fp:
+      self.__AddFile(tarinfo, fp)
     return True
 
   def Extract(self):
     """Extract the tarfile to the current directory."""
     try_mklink = True
-    div = float(len(self.tar.getmembers())) / 50.0
-    dots = 0
-    cnt = 0
 
     if self.verbose:
       sys.stdout.write('|' + ('-' * 48) + '|\n')
       sys.stdout.flush()
+      div = float(len(self.tar.getmembers())) / 50.0
+      dots = 0
+      cnt = 0
 
     for m in self.tar:
       if self.verbose:
@@ -325,6 +346,7 @@ def Main(args):
       dest='filename', default='')
   parser.add_option('-C', '--directory', help='Change directory.',
       dest='cd', default='')
+  parser.add_option('--prefix', help='Subdirectory prefix for all paths')
 
   options, args = parser.parse_args(args[1:])
   if not options.action:
@@ -356,7 +378,7 @@ def Main(args):
 
   if options.action == 'c':
     for filepath in args:
-      if not tar.Add(filepath):
+      if not tar.Add(filepath, options.prefix):
         return -1
     tar.Close()
     return 0
